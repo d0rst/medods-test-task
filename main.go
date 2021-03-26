@@ -6,7 +6,7 @@ import (
 	"log"
 	"os"
 	"strconv"
-
+	"encoding/base64"
 	"net/http"
 	"time"
 
@@ -43,6 +43,7 @@ type TokenDetails struct {
 var (
 	router = gin.Default()
 	client *redis.Client
+	testDatabase *mongo.Database
 )
 
 func init() {
@@ -60,32 +61,30 @@ func init() {
 	}
 }
 
-var testDatabase *mongo.Database
-
 func main() {
 	os.Setenv("DB_PASS", goDotEnvVariable("DB_PASS"))
 	os.Setenv("DB_NAME", goDotEnvVariable("DB_NAME"))
 	os.Setenv("ACCESS_SECRET", goDotEnvVariable("ACCESS_SECRET")) 
 	os.Setenv("REFRESH_SECRET", goDotEnvVariable("REFRESH_SECRET"))
 
-	client, err := mongo.NewClient(options.Client().ApplyURI(
+	dbClient, err := mongo.NewClient(options.Client().ApplyURI(
 		os.ExpandEnv("mongodb+srv://dorst:$DB_PASS@cluster0.2dsqb.mongodb.net/$DB_NAME?retryWrites=true&w=majority")))
 	if err != nil {
 		log.Fatal(err)
 	}
 	ctx, _ := context.WithTimeout(context.Background(), 10*time.Second)
-	err = client.Connect(ctx)
+	err = dbClient.Connect(ctx)
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer client.Disconnect(ctx)
+	defer dbClient.Disconnect(ctx)
 
-	err = client.Ping(ctx, readpref.Primary())
+	err = dbClient.Ping(ctx, readpref.Primary())
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	testDatabase = client.Database("testdb")
+	testDatabase = dbClient.Database("testdb")
 
 	router.POST("/login", Login)
 	router.POST("/token/refresh", Refresh)
@@ -119,9 +118,10 @@ func Login(c *gin.Context) {
 	if saveErr != nil {
 		c.JSON(http.StatusUnprocessableEntity, saveErr.Error())
 	}
+
 	tokens := map[string]string{
-		"access_token":  ts.AccessToken,
-		"refresh_token": ts.RefreshToken,
+		"access_token": base64.StdEncoding.EncodeToString([]byte(ts.AccessToken)),
+		"refresh_token": base64.StdEncoding.EncodeToString([]byte(ts.RefreshToken)),
 	}
 	c.JSON(http.StatusOK, tokens)
 }
@@ -161,7 +161,7 @@ func CreateToken(userid uint64) (*TokenDetails, error) {
 	atClaims["access_uuid"] = td.AccessUuid
 	atClaims["user_id"] = userid
 	atClaims["exp"] = td.AtExpires
-	at := jwt.NewWithClaims(jwt.SigningMethodHS256, atClaims)
+	at := jwt.NewWithClaims(jwt.SigningMethodHS512, atClaims)
 	td.AccessToken, err = at.SignedString([]byte(os.Getenv("ACCESS_SECRET")))
 	if err != nil {
 		return nil, err
@@ -171,7 +171,7 @@ func CreateToken(userid uint64) (*TokenDetails, error) {
 	rtClaims["refresh_uuid"] = td.RefreshUuid
 	rtClaims["user_id"] = userid
 	rtClaims["exp"] = td.RtExpires
-	rt := jwt.NewWithClaims(jwt.SigningMethodHS256, rtClaims)
+	rt := jwt.NewWithClaims(jwt.SigningMethodHS512, rtClaims)
 	td.RefreshToken, err = rt.SignedString([]byte(os.Getenv("REFRESH_SECRET")))
 	if err != nil {
 		return nil, err
@@ -209,11 +209,14 @@ func Refresh(c *gin.Context) {
 		c.JSON(http.StatusUnprocessableEntity, err.Error())
 		return
 	}
-	refreshToken := mapToken["refresh_token"]
+
+	refreshToken, err := base64.StdEncoding.DecodeString(mapToken["refresh_token"])
+    if err != nil {
+        panic(err)
+    }
 
 	//verify the token
-	
-	token, err := jwt.Parse(refreshToken, func(token *jwt.Token) (interface{}, error) {
+	token, err := jwt.Parse(string(refreshToken), func(token *jwt.Token) (interface{}, error) {
 		//Make sure that the token method conform to "SigningMethodHMAC"
 		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
 			return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
@@ -262,8 +265,8 @@ func Refresh(c *gin.Context) {
 			return
 		}
 		tokens := map[string]string{
-			"access_token":  ts.AccessToken,
-			"refresh_token": ts.RefreshToken,
+			"access_token": base64.StdEncoding.EncodeToString([]byte(ts.AccessToken)),
+			"refresh_token": base64.StdEncoding.EncodeToString([]byte(ts.RefreshToken)),
 		}
 		c.JSON(http.StatusCreated, tokens)
 	} else {
